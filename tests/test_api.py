@@ -1,4 +1,6 @@
 """End-to-end API tests."""
+import json
+
 import pytest
 
 from tests.conftest import make_request
@@ -309,3 +311,202 @@ def test_contingency_lexicographic_tie_break(client):
     assert blend["B"] == pytest.approx(70.0, abs=1e-6)
     assert blend["C"] == pytest.approx(30.0, abs=1e-6)
     assert r.json()["total_adjustment"] == pytest.approx(60.0, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# batch sizes (mixed-integer model)
+# --------------------------------------------------------------------------- #
+
+def test_solve_with_batch_size(client):
+    # Both sources batched: the continuous optimum W1=W2=500 is forbidden
+    # (500 is a multiple of 100 but not of 200), so W1=400, W2=600.
+    payload = make_request()
+    payload["sources"][0]["batch_size"] = 200
+    payload["sources"][1]["batch_size"] = 100
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "optimal"
+    blend = {a["source_id"]: a["volume"] for a in body["blend"]}
+    assert blend["W1"] == pytest.approx(400.0, abs=1e-6)
+    assert blend["W2"] == pytest.approx(600.0, abs=1e-6)
+    assert blend["W1"] % 200 == pytest.approx(0.0, abs=1e-6)
+    assert blend["W2"] % 100 == pytest.approx(0.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(1600.0, abs=1e-6)
+    assert body["indicators"]["calcium"] == pytest.approx(52.0, abs=1e-6)
+
+
+def test_solve_mixed_batch_and_continuous(client):
+    # A continuous, B batched at 100, equal costs: the lexicographic minimum
+    # is A=50, B=100 (A=0 would require the unattainable B=150).
+    payload = {
+        "target_volume": 150,
+        "sources": [
+            {"id": "A", "max_volume": 200, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100},
+            {"id": "B", "max_volume": 200, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 100},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200
+    blend = {a["source_id"]: a["volume"] for a in r.json()["blend"]}
+    assert blend["A"] == pytest.approx(50.0, abs=1e-6)
+    assert blend["B"] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_solve_batch_non_divisible_cap(client):
+    # max_volume 550 with batch 200 -> A is usable only up to 400.
+    payload = {
+        "target_volume": 500,
+        "sources": [
+            {"id": "A", "max_volume": 550, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 200},
+            {"id": "B", "max_volume": 1000, "cost": 2, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200
+    blend = {a["source_id"]: a["volume"] for a in r.json()["blend"]}
+    assert blend["A"] == pytest.approx(400.0, abs=1e-6)
+    assert blend["B"] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_solve_infeasible_unattainable_volume(client):
+    # Only multiples of 200 are attainable; 500 is not one of them.
+    payload = {
+        "target_volume": 500,
+        "sources": [
+            {"id": "A", "max_volume": 600, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 200},
+            {"id": "B", "max_volume": 800, "cost": 2, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 200},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    vol = body["achievable_ranges"]["volume"]
+    assert vol["requested"] == pytest.approx(500.0)
+    assert vol["max_below"] == pytest.approx(400.0, abs=1e-6)
+    assert vol["min_above"] == pytest.approx(600.0, abs=1e-6)
+    assert "not attainable" in body["message"]
+
+
+def test_validation_batch_size(client):
+    for bad in (0, -5, "lots"):
+        payload = make_request()
+        payload["sources"][0]["batch_size"] = bad
+        r = client.post("/api/v1/blends/solve", json=payload)
+        assert r.status_code == 422, bad
+    # non-finite values (sent as raw JSON literals) are rejected too
+    for literal in ("Infinity", "-Infinity", "NaN", "1e999"):
+        payload = make_request()
+        payload["sources"][0]["batch_size"] = "__B__"
+        raw = json.dumps(payload).replace('"__B__"', literal)
+        r = client.post(
+            "/api/v1/blends/solve",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, literal
+    # a finite positive batch size (and an omitted one) is accepted
+    payload = make_request()
+    payload["sources"][0]["batch_size"] = 250
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200
+
+
+def test_create_and_get_plan_with_batch_size(client):
+    payload = make_request(idempotency_key="batch-plan")
+    payload["sources"][0]["batch_size"] = 200
+    payload["sources"][1]["batch_size"] = 100
+    r = client.post("/api/v1/blends", json=payload)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["status"] == "optimal"
+    blend = {a["source_id"]: a["volume"] for a in body["blend"]}
+    assert blend["W1"] == pytest.approx(400.0, abs=1e-6)
+    assert blend["W2"] == pytest.approx(600.0, abs=1e-6)
+
+    g = client.get(f"/api/v1/blends/{body['plan_id']}")
+    assert g.status_code == 200
+    assert g.json() == body
+
+
+def test_idempotency_fingerprint_covers_batch_size(client):
+    payload = make_request(idempotency_key="batch-key")
+    payload["sources"][0]["batch_size"] = 200
+    r1 = client.post("/api/v1/blends", json=payload)
+    assert r1.status_code == 201
+
+    # same key, same request except the batch size -> conflict
+    changed = make_request(idempotency_key="batch-key")
+    changed["sources"][0]["batch_size"] = 100
+    assert client.post("/api/v1/blends", json=changed).status_code == 409
+
+    # identical replay still returns the stored plan
+    r2 = client.post("/api/v1/blends", json=payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("x-idempotent-replay") == "true"
+    assert r2.json() == r1.json()
+
+
+def test_contingency_with_batch_size(client):
+    payload = {
+        "target_volume": 500,
+        "sources": [
+            {"id": "A", "max_volume": 600, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 200},
+            {"id": "B", "max_volume": 800, "cost": 2, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100},
+        ],
+        "idempotency_key": "cont-batch",
+    }
+    plan = client.post("/api/v1/blends", json=payload).json()
+    assert {a["source_id"]: a["volume"] for a in plan["blend"]} == {
+        "A": pytest.approx(400.0, abs=1e-6),
+        "B": pytest.approx(100.0, abs=1e-6),
+    }
+    # cap A at 300 -> only one 200 m3 batch remains usable
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency", json={"A": 300}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "optimal"
+    rows = {a["source_id"]: a for a in body["blend"]}
+    assert rows["A"]["new_volume"] == pytest.approx(200.0, abs=1e-6)
+    assert rows["A"]["new_volume"] % 200 == pytest.approx(0.0, abs=1e-6)
+    assert rows["B"]["new_volume"] == pytest.approx(300.0, abs=1e-6)
+    assert body["total_adjustment"] == pytest.approx(400.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(800.0, abs=1e-6)
+    assert body["cost_delta"] == pytest.approx(200.0, abs=1e-6)
+
+
+def test_contingency_batch_granularity_infeasible(client):
+    payload = {
+        "target_volume": 500,
+        "sources": [
+            {"id": "A", "max_volume": 600, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 200},
+            {"id": "B", "max_volume": 600, "cost": 1, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100, "batch_size": 300},
+        ],
+        "idempotency_key": "cont-batch-inf",
+    }
+    plan = client.post("/api/v1/blends", json=payload).json()
+    assert plan["status"] == "optimal"
+    # disabling A leaves only multiples of 300 -> 500 is unattainable
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency", json={"A": 0}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    vol = body["achievable_ranges"]["volume"]
+    assert vol["max_below"] == pytest.approx(300.0, abs=1e-6)
+    assert vol["min_above"] == pytest.approx(600.0, abs=1e-6)
+    # the original plan is untouched
+    assert client.get(f"/api/v1/blends/{plan['plan_id']}").json() == plan

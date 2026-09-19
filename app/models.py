@@ -28,6 +28,15 @@ class Source(BaseModel):
     calcium: float = Field(..., ge=0, description="calcium concentration, mg/L")
     magnesium: float = Field(..., ge=0, description="magnesium concentration, mg/L")
     alkalinity: float = Field(..., ge=0, description="alkalinity, mg/L as CaCO3")
+    batch_size: Optional[float] = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "optional delivery batch size, m3; when set, the source may only "
+            "be used in non-negative integer multiples of it"
+        ),
+    )
 
     @field_validator("id", mode="before")
     @classmethod

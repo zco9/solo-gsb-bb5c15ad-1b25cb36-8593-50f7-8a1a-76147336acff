@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
@@ -39,7 +41,9 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "最低成本饮用水混配优化：在满足钙 / 镁 / 碱度区间与水源供给上限的"
-        "前提下最小化总成本；成本并列时取按水源 ID 排序后用量向量字典序最小者；"
+        "前提下最小化总成本；水源可设置批次量 batch_size，此时其用量必须为"
+        "批次量的非负整数倍（混合整数规划直接求解，不做连续解四舍五入）；"
+        "成本并列时取按水源 ID 排序后用量向量字典序最小者；"
         "不可行时返回各指标的可达范围。"
     ),
     lifespan=lifespan,
@@ -49,6 +53,32 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+
+def _json_safe(obj: Any) -> Any:
+    """Make an object JSON-compliant by stringifying non-finite floats.
+
+    Pydantic echoes rejected input values (e.g. an ``inf`` batch size) in its
+    error details; ``inf``/``nan`` are not JSON compliant and would otherwise
+    crash the default 422 response rendering.
+    """
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
+
 
 def _round6(obj: Any) -> Any:
     if isinstance(obj, float):
@@ -70,6 +100,7 @@ def _source_data(req: BlendRequest) -> List[SourceData]:
                 calcium=s.calcium,
                 magnesium=s.magnesium,
                 alkalinity=s.alkalinity,
+                batch_size=s.batch_size,
             )
             for s in req.sources
         ),
@@ -266,11 +297,11 @@ def plan_contingency(plan_id: int, reductions: Dict[str, float]) -> JSONResponse
     At least one source must be listed, each new cap must satisfy
     ``0 <= new_cap <= original max_volume``, and sources not listed keep
     their original cap.  The target volume, indicator windows, water
-    quality (source concentrations) and costs are taken from the stored
-    request.  Among feasible allocations the service first minimizes the
-    total absolute volume change versus the saved blend, then the total
-    cost, and finally takes the id-sorted usage-vector lexicographic
-    minimum.
+    quality (source concentrations), unit costs and batch sizes are taken
+    from the stored request.  Among feasible allocations the service first
+    minimizes the total absolute volume change versus the saved blend,
+    then the total cost, and finally takes the id-sorted usage-vector
+    lexicographic minimum.
 
     The contingency result is neither saved nor does it modify the
     original plan.  Infeasibility under the new caps is reported with
