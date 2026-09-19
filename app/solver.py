@@ -1,30 +1,38 @@
-"""Linear-programming blend optimizer.
+"""Mixed-integer blend optimizer.
 
 Model
 -----
-Variables x_i >= 0: volume taken from source i.
+Variables z_i >= 0: units drawn from source i.  When source i declares a
+``batch_size`` b_i the variable is constrained integer and the volume is
+``x_i = b_i * z_i``; otherwise z_i is continuous and ``x_i = z_i``.
 
     minimize    sum(cost_i * x_i)
     subject to  sum(x_i)                       = target_volume
                 lo_j * target_volume <= sum(conc_ij * x_i) <= hi_j * target_volume
                 x_i                            <= max_volume_i
+                z_i in Z>=0 for batched sources, z_i in R>=0 otherwise
+
+Continuous and batched sources are solved together in a single mixed-integer
+program; a continuous optimum is never rounded afterwards.
 
 When several optima share the same minimal cost, the usage vector ordered by
-ascending source id is minimized lexicographically via a sequence of LPs.
+ascending source id is minimized lexicographically via a sequence of MIPs.
 
 If the problem is infeasible, the achievable (min, max) concentration range of
-every indicator is reported, projected onto the supply/volume feasible set.
+every indicator is reported, projected onto the *same* mixed-integer feasible
+set (supply caps, volume and batch constraints).
 
 Supply-reduction contingency plans (``solve_contingency``) use the same
-feasible set with tightened supply caps, but optimize a lexicographic
-objective: first minimize the total absolute volume change versus the stored
-allocation, then minimize cost, and finally the source-id-ordered usage
-vector lexicographically.
+mixed-integer feasible set with tightened supply caps, but optimize a
+lexicographic objective: first minimize the total absolute volume change
+versus the stored allocation, then minimize cost, and finally the
+source-id-ordered usage vector lexicographically.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import linprog
@@ -47,6 +55,25 @@ class SourceData:
     calcium: float
     magnesium: float
     alkalinity: float
+    batch_size: Optional[float] = None
+
+
+@dataclass
+class _Model:
+    """Constraint matrix description in the (possibly scaled) variable space.
+
+    All matrices/vectors use ``z`` variables.  Volumes are recovered as
+    ``x = scales * z``; ``integrality`` marks the batch-count variables.
+    """
+
+    n: int
+    scales: np.ndarray           # batch_size per source, 1.0 when continuous
+    integrality: np.ndarray      # 1 for integer (batched) variables, else 0
+    bounds: List[Tuple[float, float]]
+    A_eq: np.ndarray
+    b_eq: np.ndarray
+    A_ub: Optional[np.ndarray]
+    b_ub: Optional[np.ndarray]
 
 
 @dataclass
@@ -74,32 +101,130 @@ class ContingencyOutput:
     message: Optional[str] = None
 
 
+# --------------------------------------------------------------------------- #
+# model construction
+# --------------------------------------------------------------------------- #
+
+def _scales(sources: Sequence[SourceData]) -> np.ndarray:
+    return np.array(
+        [1.0 if s.batch_size is None else float(s.batch_size) for s in sources],
+        dtype=float,
+    )
+
+
+def _integrality(sources: Sequence[SourceData]) -> np.ndarray:
+    # Decided from the flag, not from scale == 1 (batch_size 1.0 stays integer).
+    return np.array([0.0 if s.batch_size is None else 1.0 for s in sources],
+                    dtype=float)
+
+
+def _source_bounds(sources: Sequence[SourceData], scales: np.ndarray,
+                   caps: Optional[Mapping[str, float]] = None
+                   ) -> List[Tuple[float, float]]:
+    bounds: List[Tuple[float, float]] = []
+    for s, scale in zip(sources, scales):
+        cap = float(s.max_volume) if caps is None else float(caps.get(s.id, s.max_volume))
+        if s.batch_size is None:
+            hi = cap
+        else:
+            hi = float(math.floor(cap / scale + 1e-12))
+        bounds.append((0.0, hi))
+    return bounds
+
+
+def _indicator_constraints(
+    sources: Sequence[SourceData],
+    target_volume: float,
+    limits: Mapping[str, Tuple[float, float]],
+    scales: np.ndarray,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Indicator-window rows in z-space:
+    ``lo_j*V <= sum(conc_ij * scale_i * z_i) <= hi_j*V``."""
+    rows, rhs = [], []
+    for name in INDICATORS:
+        rng = limits.get(name)
+        if rng is None:
+            continue
+        lo, hi = rng
+        coeff = np.array([getattr(s, name) for s in sources], dtype=float) * scales
+        rows.append(-coeff)
+        rhs.append(-lo * target_volume)
+        rows.append(coeff)
+        rhs.append(hi * target_volume)
+    if not rows:
+        return None, None
+    return np.asarray(rows), np.asarray(rhs)
+
+
+def _build_model(
+    sources: Sequence[SourceData],
+    target_volume: float,
+    limits: Mapping[str, Tuple[float, float]],
+    caps: Optional[Mapping[str, float]] = None,
+) -> _Model:
+    """Assemble the (mixed-integer) feasible-set description in z-space."""
+    n = len(sources)
+    scales = _scales(sources)
+    bounds = _source_bounds(sources, scales, caps)
+    A_eq = scales.reshape(1, -1)
+    b_eq = np.array([float(target_volume)])
+    A_ub, b_ub = _indicator_constraints(sources, target_volume, limits, scales)
+    return _Model(
+        n=n,
+        scales=scales,
+        integrality=_integrality(sources),
+        bounds=bounds,
+        A_eq=A_eq,
+        b_eq=b_eq,
+        A_ub=A_ub,
+        b_ub=b_ub,
+    )
+
+
+_UNSET = object()
+
+
+def _lp(c, model: _Model, bounds=_UNSET, A_ub=_UNSET, b_ub=_UNSET,
+        A_eq=_UNSET, b_eq=_UNSET):
+    """linprog wrapper forwarding the model's variable integrality.
+
+    Constraint arguments default to the model's matrices; pass ``None``
+    explicitly to drop that constraint group entirely."""
+    return linprog(
+        c,
+        A_ub=model.A_ub if A_ub is _UNSET else A_ub,
+        b_ub=model.b_ub if b_ub is _UNSET else b_ub,
+        A_eq=model.A_eq if A_eq is _UNSET else A_eq,
+        b_eq=model.b_eq if b_eq is _UNSET else b_eq,
+        bounds=model.bounds if bounds is _UNSET else bounds,
+        integrality=model.integrality,
+        method="highs",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# main solve
+# --------------------------------------------------------------------------- #
+
 def solve_blend(
     sources: List[SourceData],
     target_volume: float,
     limits: Dict[str, Tuple[float, float]],
 ) -> SolveOutput:
-    """Solve the blending LP.  ``limits`` maps indicator name -> (min, max)."""
+    """Solve the blending MIP.  ``limits`` maps indicator name -> (min, max)."""
     sources = sorted(sources, key=lambda s: s.id)
-    n = len(sources)
+    model = _build_model(sources, target_volume, limits)
     costs = np.array([s.cost for s in sources], dtype=float)
-    bounds = [(0.0, float(s.max_volume)) for s in sources]
+    c = costs * model.scales
 
-    A_eq = np.ones((1, n))
-    b_eq = np.array([float(target_volume)])
-
-    A_ub, b_ub = _indicator_constraints(sources, target_volume, limits)
-
-    res = linprog(
-        costs, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
-        bounds=bounds, method="highs",
-    )
+    res = _lp(c, model)
     if res.status == 2:  # provably infeasible
-        return _infeasible(sources, target_volume, limits, bounds)
+        return _infeasible(sources, model, target_volume, limits)
     if res.status != 0:
-        raise RuntimeError(f"LP solver failed (status {res.status}): {res.message}")
+        raise RuntimeError(f"MIP solver failed (status {res.status}): {res.message}")
 
-    x = _lexicographic_min(costs, res.x, A_ub, b_ub, A_eq, b_eq, bounds)
+    z = _lexicographic_min(c, res.x, model)
+    x = model.scales * z
     indicators = {
         name: float(np.array([getattr(s, name) for s in sources]) @ x) / target_volume
         for name in INDICATORS
@@ -112,27 +237,68 @@ def solve_blend(
     )
 
 
-def _indicator_constraints(
-    sources: List[SourceData],
-    target_volume: float,
-    limits: Mapping[str, Tuple[float, float]],
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """Indicator-window rows: lo_j*V <= sum(conc_ij * x_i) <= hi_j*V."""
-    rows, rhs = [], []
-    for name in INDICATORS:
-        rng = limits.get(name)
-        if rng is None:
-            continue
-        lo, hi = rng
-        conc = np.array([getattr(s, name) for s in sources], dtype=float)
-        rows.append(-conc)
-        rhs.append(-lo * target_volume)
-        rows.append(conc)
-        rhs.append(hi * target_volume)
-    if not rows:
-        return None, None
-    return np.asarray(rows), np.asarray(rhs)
+def _lexicographic_min(c, z_star, model: _Model) -> np.ndarray:
+    """Among all cost-optimal solutions, minimize (z_1, ..., z_n)
+    lexicographically (indices follow the id-sorted source order).  Scaling is
+    non-negative so this also lexicographically minimizes (x_1, ..., x_n)."""
+    # Pin the optimal cost as an equality; z_star satisfies it by construction.
+    cost_value = float(c @ z_star)
+    A_eq2 = np.vstack([model.A_eq, c.reshape(1, -1)])
+    b_eq2 = np.append(model.b_eq, cost_value)
+    try:
+        return _sequential_min(model, model.A_ub, model.b_ub, A_eq2, b_eq2)
+    except RuntimeError:
+        # Fallback: relax the cost pin to a tight inequality.
+        tol = _COST_RTOL * max(1.0, abs(cost_value))
+        cost_row = c.reshape(1, -1)
+        A_ub2 = cost_row if model.A_ub is None else np.vstack([model.A_ub, cost_row])
+        b_ub2 = (
+            np.array([cost_value + tol])
+            if model.b_ub is None
+            else np.append(model.b_ub, cost_value + tol)
+        )
+        return _sequential_min(model, A_ub2, b_ub2, model.A_eq, model.b_eq)
 
+
+def _sequential_min(model: _Model, A_ub, b_ub, A_eq, b_eq,
+                    bounds=None, n_coords: Optional[int] = None) -> np.ndarray:
+    """Lexicographically minimize (z_0, ..., z_{n-1}) by solving one MIP per
+    coordinate; ``bounds`` may contain additional variables (e.g. slack
+    variables), which stay free after the first ``n`` coordinates."""
+    n = model.n if n_coords is None else n_coords
+    bnds = list(model.bounds if bounds is None else bounds)
+    n_vars = len(bnds)
+    z = np.zeros(n_vars)
+    for k in range(n):
+        obj = np.zeros(n_vars)
+        obj[k] = 1.0
+        r = _lp(obj, model, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                bounds=bnds)
+        if r.status != 0:
+            raise RuntimeError(
+                f"lexicographic refinement failed at index {k}: {r.message}"
+            )
+        lo0, hi0 = bnds[k]
+        v = min(max(float(r.x[k]), lo0), hi0)
+        if model.integrality[k]:
+            # Pin integer coordinates at the exact integer returned by the
+            # MIP.  A fractional pin (v +/- relative eps) may contain no
+            # integer at all once v is large, making the next solve
+            # spuriously infeasible.
+            iv = int(round(v))
+            iv = max(int(math.ceil(lo0 - 1e-9)), min(int(math.floor(hi0 + 1e-9)), iv))
+            z[k] = float(iv)
+            bnds[k] = (float(iv), float(iv))
+        else:
+            z[k] = v
+            eps = _FIX_RTOL * max(1.0, abs(v))
+            bnds[k] = (max(lo0, v - eps), min(hi0, v + eps))
+    return z[: model.n]
+
+
+# --------------------------------------------------------------------------- #
+# supply-reduction contingencies
+# --------------------------------------------------------------------------- #
 
 def solve_contingency(
     sources: List[SourceData],
@@ -151,33 +317,35 @@ def solve_contingency(
       3. among those, minimize the usage vector (source ids ascending)
          lexicographically.
 
-    Target volume, indicator windows and unit costs are unchanged.
-    ``new_caps`` only needs to list sources whose cap is reduced; every
-    other source keeps its original ``max_volume``.
+    Target volume, indicator windows, unit costs and batch sizes are
+    unchanged.  ``new_caps`` only needs to list sources whose cap is reduced;
+    every other source keeps its original ``max_volume``.
     """
     sources = sorted(sources, key=lambda s: s.id)
-    n = len(sources)
-    x0 = np.array([float(original_volumes[s.id]) for s in sources], dtype=float)
-    bounds = [(0.0, float(new_caps.get(s.id, s.max_volume))) for s in sources]
+    model = _build_model(sources, target_volume, limits, caps=new_caps)
+    n = model.n
+    scales = model.scales
+    # The stored plan honors the batch lattice; snap tiny rounding noise so
+    # that the L1 reference point sits exactly on it.
+    x0 = np.zeros(n)
+    for i, s in enumerate(sources):
+        v = float(original_volumes[s.id])
+        if s.batch_size is not None:
+            v = float(round(v / s.batch_size) * s.batch_size)
+        x0[i] = v
     costs = np.array([s.cost for s in sources], dtype=float)
 
-    A_eq = np.ones((1, n))
-    b_eq = np.array([float(target_volume)])
-    A_ub, b_ub = _indicator_constraints(sources, target_volume, limits)
-
-    # Phase 1: minimize sum(d_i) subject to |x_i - x0_i| <= d_i.
-    # Variables are ordered (x_1..x_n, d_1..d_n).
-    A1, b1, A1_eq, b1_eq, bounds1 = _l1_model(
-        x0, A_ub, b_ub, A_eq, b_eq, bounds
-    )
+    # Phase 1: minimize sum(d_i) subject to |scale_i z_i - x0_i| <= d_i.
+    # Variables are ordered (z_1..z_n, d_1..d_n).
+    A1, b1, A1_eq, b1_eq, bounds1, integ1 = _l1_model(x0, model)
     p1 = linprog(
         np.concatenate([np.zeros(n), np.ones(n)]),
         A_ub=A1, b_ub=b1, A_eq=A1_eq, b_eq=b1_eq,
-        bounds=bounds1, method="highs",
+        bounds=bounds1, integrality=integ1, method="highs",
     )
     if p1.status == 2:  # provably infeasible under the new caps
         achievable, message = _analyze_infeasible(
-            sources, target_volume, limits, bounds
+            sources, model, target_volume, limits, caps=new_caps
         )
         return ContingencyOutput(
             status="infeasible",
@@ -185,13 +353,15 @@ def solve_contingency(
             message=message,
         )
     if p1.status != 0:
-        raise RuntimeError(f"LP solver failed (status {p1.status}): {p1.message}")
+        raise RuntimeError(f"MIP solver failed (status {p1.status}): {p1.message}")
     adj_star = float(p1.fun)
 
-    x = _contingency_lexicographic(
-        costs, x0, adj_star, A_ub, b_ub, A_eq, b_eq, bounds
+    z = _contingency_lexicographic(
+        costs * scales, x0, adj_star, A1, b1, A1_eq, b1_eq, bounds1, integ1,
+        model,
     )
 
+    x = scales * z
     deltas = x - x0
     indicators = {
         name: float(np.array([getattr(s, name) for s in sources]) @ x) / target_volume
@@ -208,37 +378,36 @@ def solve_contingency(
     )
 
 
-def _l1_model(x0, A_ub, b_ub, A_eq, b_eq, bounds):
-    """Build the (x, d) model whose feasible set is exactly the allocations
-    x satisfying the original constraints with |x_i - x0_i| <= d_i."""
-    n = len(x0)
+def _l1_model(x0, model: _Model):
+    """Build the (z, d) model whose feasible set is exactly the allocations
+    z satisfying the original constraints with |scale_i z_i - x0_i| <= d_i."""
+    n = model.n
     eye = np.eye(n)
     rows = [
-        np.hstack([eye, -eye]),       # x_i - d_i <= x0_i
-        np.hstack([-eye, -eye]),      # -x_i - d_i <= -x0_i
+        np.hstack([eye * model.scales.reshape(-1, 1), -eye]),  # scale z - d <= x0
+        np.hstack([-eye * model.scales.reshape(-1, 1), -eye]),  # -scale z - d <= -x0
     ]
     rhs = [x0, -x0]
-    if A_ub is not None:
-        rows.insert(0, np.hstack([A_ub, np.zeros((A_ub.shape[0], n))]))
-        rhs.insert(0, b_ub)
+    if model.A_ub is not None:
+        rows.insert(0, np.hstack([model.A_ub, np.zeros((model.A_ub.shape[0], n))]))
+        rhs.insert(0, model.b_ub)
     A = np.vstack(rows)
     b = np.concatenate(rhs)
-    A_eq_ext = np.hstack([A_eq, np.zeros((A_eq.shape[0], n))])
-    bounds_ext = list(bounds) + [(0.0, None)] * n
-    return A, b, A_eq_ext, b_eq, bounds_ext
+    A_eq_ext = np.hstack([model.A_eq, np.zeros((model.A_eq.shape[0], n))])
+    bounds_ext = list(model.bounds) + [(0.0, None)] * n
+    integ_ext = np.concatenate([model.integrality, np.zeros(n)])
+    return A, b, A_eq_ext, model.b_eq, bounds_ext, integ_ext
 
 
 def _contingency_lexicographic(
-    costs, x0, adj_star, A_ub, b_ub, A_eq, b_eq, bounds
+    c, x0, adj_star, A_l1, b_l1, A_eq_ext, b_eq_ext, bounds_ext, integ_ext,
+    model: _Model,
 ) -> np.ndarray:
     """Phase 2+3: within the minimum-change allocations, minimize cost and
     then the id-sorted usage vector lexicographically."""
-    n = len(x0)
-    A_l1, b_l1, A_eq_ext, b_eq_ext, bounds_ext = _l1_model(
-        x0, A_ub, b_ub, A_eq, b_eq, bounds
-    )
+    n = model.n
     change_row = np.concatenate([np.zeros(n), np.ones(n)])
-    cost_row = np.concatenate([costs, np.zeros(n)])
+    cost_row = np.concatenate([c, np.zeros(n)])
     adj_tol = _FIX_RTOL * max(1.0, abs(adj_star))
 
     # Phase 2: minimum cost with the total change pinned at its minimum.
@@ -246,14 +415,15 @@ def _contingency_lexicographic(
     b_eq2 = np.append(b_eq_ext, adj_star)
     p2 = linprog(
         cost_row, A_ub=A_l1, b_ub=b_l1, A_eq=A_eq2, b_eq=b_eq2,
-        bounds=bounds_ext, method="highs",
+        bounds=bounds_ext, integrality=integ_ext, method="highs",
     )
     if p2.status != 0:  # numerical issue: relax the pin to a tight inequality
         p2 = linprog(
             cost_row,
             A_ub=np.vstack([A_l1, change_row]),
             b_ub=np.append(b_l1, adj_star + adj_tol),
-            A_eq=A_eq_ext, b_eq=b_eq_ext, bounds=bounds_ext, method="highs",
+            A_eq=A_eq_ext, b_eq=b_eq_ext, bounds=bounds_ext,
+            integrality=integ_ext, method="highs",
         )
         if p2.status != 0:
             raise RuntimeError(
@@ -261,66 +431,38 @@ def _contingency_lexicographic(
             )
     cost_star = float(p2.fun)
 
-    # Phase 3: lex-min (x_1, ..., x_n) among min-change, min-cost solutions.
+    # Phase 3: lex-min (z_1, ..., z_n) among min-change, min-cost solutions.
     A_eq3 = np.vstack([A_eq2, cost_row])
     b_eq3 = np.append(b_eq2, cost_star)
+    ext_model = _Model(
+        n=n,
+        scales=model.scales,
+        integrality=integ_ext,
+        bounds=bounds_ext,
+        A_eq=model.A_eq,
+        b_eq=model.b_eq,
+        A_ub=model.A_ub,
+        b_ub=model.b_ub,
+    )
     try:
-        return _sequential_min(n, A_l1, b_l1, A_eq3, b_eq3, bounds_ext)
+        return _sequential_min(ext_model, A_l1, b_l1, A_eq3, b_eq3)
     except RuntimeError:
         cost_tol = _COST_RTOL * max(1.0, abs(cost_star))
         A_ub3 = np.vstack([A_l1, change_row, cost_row])
         b_ub3 = np.append(b_l1, [adj_star + adj_tol, cost_star + cost_tol])
-        return _sequential_min(n, A_ub3, b_ub3, A_eq_ext, b_eq_ext, bounds_ext)
+        return _sequential_min(ext_model, A_ub3, b_ub3, A_eq_ext, b_eq_ext)
 
 
-def _lexicographic_min(costs, x_star, A_ub, b_ub, A_eq, b_eq, bounds) -> np.ndarray:
-    """Among all cost-optimal solutions, minimize (x_1, ..., x_n)
-    lexicographically (indices follow the id-sorted source order)."""
-    n = len(costs)
-    # Pin the optimal cost as an equality; x_star satisfies it by construction.
-    cost_value = float(costs @ x_star)
-    A_eq2 = np.vstack([A_eq, costs.reshape(1, -1)])
-    b_eq2 = np.append(b_eq, cost_value)
-    try:
-        return _sequential_min(n, A_ub, b_ub, A_eq2, b_eq2, bounds)
-    except RuntimeError:
-        # Fallback: relax the cost pin to a tight inequality.
-        tol = _COST_RTOL * max(1.0, abs(cost_value))
-        cost_row = costs.reshape(1, -1)
-        A_ub2 = cost_row if A_ub is None else np.vstack([A_ub, cost_row])
-        b_ub2 = (
-            np.array([cost_value + tol])
-            if b_ub is None
-            else np.append(b_ub, cost_value + tol)
-        )
-        return _sequential_min(n, A_ub2, b_ub2, A_eq, b_eq, bounds)
+# --------------------------------------------------------------------------- #
+# infeasibility analysis
+# --------------------------------------------------------------------------- #
 
-
-def _sequential_min(n, A_ub, b_ub, A_eq, b_eq, bounds) -> np.ndarray:
-    """Lexicographically minimize (x_0, ..., x_{n-1}) by solving one LP per
-    coordinate; ``bounds`` may contain additional variables (e.g. slack
-    variables), which stay free after the first ``n`` coordinates."""
-    bnds = list(bounds)
-    n_vars = len(bnds)
-    x = np.zeros(n_vars)
-    for k in range(n):
-        obj = np.zeros(n_vars)
-        obj[k] = 1.0
-        r = linprog(obj, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
-                    bounds=bnds, method="highs")
-        if r.status != 0:
-            raise RuntimeError(f"lexicographic refinement failed at index {k}: {r.message}")
-        lo0, hi0 = bounds[k]
-        v = min(max(float(r.x[k]), lo0), hi0)
-        x[k] = v
-        eps = _FIX_RTOL * max(1.0, abs(v))
-        bnds[k] = (max(lo0, v - eps), min(hi0, v + eps))
-    return x[:n]
-
-
-def _infeasible(sources, target_volume, limits, bounds) -> SolveOutput:
+def _infeasible(sources, model, target_volume, limits,
+                caps=None) -> SolveOutput:
     """Explain infeasibility with per-indicator achievable ranges."""
-    achievable, message = _analyze_infeasible(sources, target_volume, limits, bounds)
+    achievable, message = _analyze_infeasible(
+        sources, model, target_volume, limits, caps=caps
+    )
     return SolveOutput(
         status="infeasible",
         achievable_ranges=achievable,
@@ -328,10 +470,33 @@ def _infeasible(sources, target_volume, limits, bounds) -> SolveOutput:
     )
 
 
-def _analyze_infeasible(sources, target_volume, limits, bounds):
+def _max_attainable_volume(sources, caps, volume=None) -> float:
+    """Largest volume attainable under the given caps and batch sizes.
+
+    When ``volume`` is given it acts as an upper bound, so the result is the
+    largest attainable volume not exceeding it."""
+    m = _build_model(sources, 0.0, {}, caps=caps)
+    A_ub, b_ub = None, None
+    if volume is not None:
+        A_ub = m.scales.reshape(1, -1)
+        b_ub = np.array([float(volume)])
+    res = _lp(-m.scales, m, A_ub=A_ub, b_ub=b_ub, A_eq=None, b_eq=None)
+    if res.status != 0:
+        return 0.0
+    return float(m.scales @ res.x)
+
+
+def _analyze_infeasible(sources, model, target_volume, limits, caps=None):
     """Per-indicator achievable ranges and a human-readable explanation,
-    projected onto the supply/volume feasible set."""
-    total_supply = sum(hi for _, hi in bounds)
+    projected onto the mixed-integer supply/volume feasible set.
+
+    The projection reuses the *same* caps as the failing model (original
+    supply caps on the solve path, reduced caps on the contingency path) and
+    honors every batch-size constraint.  When the exact target volume cannot
+    be assembled, the ranges are reported at the largest attainable volume."""
+    total_supply = sum(
+        hi * scale for (_, hi), scale in zip(model.bounds, model.scales)
+    )
     achievable: Dict[str, dict] = {}
     messages: List[str] = []
 
@@ -342,15 +507,34 @@ def _analyze_infeasible(sources, target_volume, limits, bounds):
         )
         achievable["volume"] = {"requested": float(target_volume), "max": float(total_supply)}
         volume = float(total_supply)
+    elif model.integrality.any():
+        # Aggregate supply suffices, but the batch lattice may not contain the
+        # exact target volume: first test the volume equation itself (caps and
+        # batches only), then fall back to the largest attainable volume.
+        feas = _lp(np.zeros(model.n), model, A_ub=None, b_ub=None)
+        if feas.status == 2:
+            vmax = _max_attainable_volume(sources, caps, volume=target_volume)
+            volume = vmax
+            messages.append(
+                f"the target volume {target_volume:g} cannot be assembled under the "
+                f"batch-size constraints; the largest attainable volume not above "
+                f"it is {vmax:g}"
+            )
+            achievable["volume"] = {
+                "requested": float(target_volume), "max": float(vmax),
+            }
 
     if volume > 0:
-        n = len(sources)
-        A_eq = np.ones((1, n))
-        b_eq = np.array([volume])
+        # Projection model: the same caps and batch lattice, but indicator
+        # windows are deliberately excluded so the min/max MIPs scan the whole
+        # supply/volume feasible set.
+        proj_model = _build_model(sources, volume, {}, caps=caps)
         for name in INDICATORS:
-            conc = np.array([getattr(s, name) for s in sources], dtype=float)
-            lo_res = linprog(conc, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
-            hi_res = linprog(-conc, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
+            conc = np.array(
+                [getattr(s, name) for s in sources], dtype=float
+            ) * proj_model.scales
+            lo_res = _lp(conc, proj_model)
+            hi_res = _lp(-conc, proj_model)
             entry: Dict[str, float] = {}
             if lo_res.status == 0:
                 entry["min"] = float(lo_res.fun) / volume
@@ -376,6 +560,6 @@ def _analyze_infeasible(sources, target_volume, limits, bounds):
     if not messages:
         messages.append(
             "indicator ranges are individually attainable but jointly incompatible "
-            "under the supply and volume constraints"
+            "under the supply, volume and batch-size constraints"
         )
     return achievable, "; ".join(messages)

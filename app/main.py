@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
@@ -39,8 +40,10 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "最低成本饮用水混配优化：在满足钙 / 镁 / 碱度区间与水源供给上限的"
-        "前提下最小化总成本；成本并列时取按水源 ID 排序后用量向量字典序最小者；"
-        "不可行时返回各指标的可达范围。"
+        "前提下最小化总成本；水源可设置 batch_size（批次体积），设置后用量"
+        "必须为其非负整数倍，连续与批次水源在同一混合整数模型中求解；"
+        "成本并列时取按水源 ID 排序后用量向量字典序最小者；不可行时返回"
+        "各指标在同一混合整数可行集上的可达范围。"
     ),
     lifespan=lifespan,
 )
@@ -60,6 +63,35 @@ def _round6(obj: Any) -> Any:
     return obj
 
 
+def _json_safe(obj: Any) -> Any:
+    """Make validation-error payloads JSON-serializable.
+
+    Pydantic echoes the offending input (e.g. a NaN/inf ``batch_size``) and
+    embeds the original exception object in ``ctx``; neither can be encoded
+    by the strict JSON encoder.  Non-finite numbers are replaced by null and
+    any other non-primitive value by its string form.
+    """
+    if isinstance(obj, bool) or isinstance(obj, int) or obj is None:
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return str(obj)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(exc.errors())},
+    )
+
+
 def _source_data(req: BlendRequest) -> List[SourceData]:
     return sorted(
         (
@@ -70,6 +102,7 @@ def _source_data(req: BlendRequest) -> List[SourceData]:
                 calcium=s.calcium,
                 magnesium=s.magnesium,
                 alkalinity=s.alkalinity,
+                batch_size=s.batch_size,
             )
             for s in req.sources
         ),

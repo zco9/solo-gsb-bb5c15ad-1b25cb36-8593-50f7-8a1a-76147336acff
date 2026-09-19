@@ -1,6 +1,7 @@
 """Pydantic request/response schemas."""
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -28,11 +29,40 @@ class Source(BaseModel):
     calcium: float = Field(..., ge=0, description="calcium concentration, mg/L")
     magnesium: float = Field(..., ge=0, description="magnesium concentration, mg/L")
     alkalinity: float = Field(..., ge=0, description="alkalinity, mg/L as CaCO3")
+    batch_size: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "optional delivery batch size in m3; when set, the volume drawn "
+            "from this source must be a non-negative integer multiple of it "
+            "and not exceed max_volume; when omitted the volume is continuous"
+        ),
+    )
 
     @field_validator("id", mode="before")
     @classmethod
     def _coerce_id(cls, v: Any) -> str:
         return str(v).strip()
+
+    @field_validator("batch_size", mode="before")
+    @classmethod
+    def _coerce_batch_size(cls, v: Any) -> Any:
+        """Reject NaN/+inf/-inf explicitly and non-finite numeric strings.
+
+        Pydantic's ``gt=0`` already excludes negatives, zero and null/non
+        numeric input; this adds the finite-number requirement.
+        """
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("batch_size must be a finite positive number")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return v  # let Pydantic produce its standard type error
+        if not math.isfinite(f):
+            raise ValueError("batch_size must be a finite positive number")
+        return f
 
 
 class BlendRequest(BaseModel):
